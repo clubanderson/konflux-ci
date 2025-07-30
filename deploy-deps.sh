@@ -5,8 +5,8 @@ IS_OPENSHIFT=false
 
 main() {
     echo "🔍 Checking requirements" >&2
-    check_req
     detect_platform
+    check_req
     echo "🧪 Testing PVC creation for default storage class" >&2
     test_pvc_binding
     echo "🌊 Deploying Konflux Dependencies" >&2
@@ -15,8 +15,23 @@ main() {
     "${script_path}/wait-for-all.sh"
 }
 
+detect_platform() {
+    if kubectl get clusterversion version &> /dev/null; then
+        echo "🎯 Detected OpenShift environment"
+        IS_OPENSHIFT=true
+    else
+        echo "🎯 Detected Kubernetes environment"
+        IS_OPENSHIFT=false
+    fi
+}
+
 check_req(){
-    local requirements=(kubectl openssl)
+    if [[ "${IS_OPENSHIFT}" == "true" ]]; then
+        local requirements=(kubectl openssl yq oc)
+    else
+        local requirements=(kubectl openssl)
+    fi
+
     local uninstalled_requirements=()
 
     for i in "${requirements[@]}"; do
@@ -38,33 +53,12 @@ check_req(){
     fi
 }
 
-detect_platform() {
-    if kubectl get clusterversion version &> /dev/null; then
-        echo "🎯 Detected OpenShift environment"
-        IS_OPENSHIFT=true
-    else
-        echo "🎯 Detected Kubernetes environment"
-        IS_OPENSHIFT=false
-    fi
-}
-
-sanitize_for_openshift() {
-    local dir="$1"
-    if [ "$IS_OPENSHIFT" = true ]; then
-        echo "🔧 Sanitizing manifests for OpenShift in: $dir"
-        find "$dir" -type f -name '*.yaml' -o -name '*.yml' | while read -r file; do
-            sed -i '/runAsUser:/d;/runAsGroup:/d;/securityContext: *{ *}/d' "$file"
-        done
-    fi
-}
-
 deploy() {
     echo "🔐 Deploying Cert Manager..." >&2
     deploy_cert_manager
     echo "🤝 Deploying Trust Manager..." >&2
     deploy_trust_manager
     echo "📜 Setting up Cluster Issuer..." >&2
-    sanitize_for_openshift "${script_path}/dependencies/cluster-issuer"
     kubectl apply -k "${script_path}/dependencies/cluster-issuer"
     echo "🐱 Deploying Tekton..." >&2
     deploy_tekton
@@ -91,7 +85,6 @@ test_pvc_binding(){
 
 deploy_cert_manager() {
     local dir="${script_path}/dependencies/cert-manager"
-    sanitize_for_openshift "$dir"
     kubectl apply -k "$dir"
     sleep 5
     retry "kubectl wait --for=condition=Ready --timeout=120s -l app.kubernetes.io/instance=cert-manager -n cert-manager pod" \
@@ -100,7 +93,6 @@ deploy_cert_manager() {
 
 deploy_trust_manager() {
     local dir="${script_path}/dependencies/trust-manager"
-    sanitize_for_openshift "$dir"
     kubectl apply -k "$dir"
     sleep 5
     retry "kubectl wait --for=condition=Ready --timeout=60s -l app.kubernetes.io/instance=trust-manager -n cert-manager pod" \
@@ -110,21 +102,55 @@ deploy_trust_manager() {
 deploy_tekton() {
     echo "  🐱 Installing Tekton Operator..." >&2
     local operator_dir="${script_path}/dependencies/tekton-operator"
-    sanitize_for_openshift "$operator_dir"
-    kubectl apply -k "$operator_dir"
+    kubectl apply -k "$operator_dir" -n tekton-operator
+    retry " kubectl wait --for=jsonpath={status.phase}=Active namespace/tekton-pipelines --timeout=180s" \
+        "Tekton Operator did not successfuly provision the \`tekton-pipelines\` ns."
+    if [[ "${IS_OPENSHIFT}" == "true" ]]; then
+
+        OCP_TKN_SAs=("tekton-events-controller" "tekton-pipelines-controller" "tekton-pipelines-resolvers" "tekton-pipelines-webhook" "tekton-operators-proxy-webhook")
+        for sa in "${OCP_TKN_SAs[@]}"; do
+            oc adm policy add-scc-to-user anyuid -z "${sa}" -n tekton-pipelines
+        done
+
+        kubectl patch deployment tekton-pipelines-webhook \
+            -n tekton-pipelines \
+            --type=json \
+            -p='[{ "op": "remove", "path": "/spec/template/spec/containers/0/securityContext/runAsUser" },{ "op": "remove", "path": "/spec/template/spec/containers/0/securityContext/runAsGroup" }]'
+
+        
+
+        kubectl patch deployment tekton-events-controller \
+            -n tekton-pipelines \
+            --type=json \
+            -p='[{ "op": "remove", "path": "/spec/template/spec/containers/0/securityContext/runAsUser" },{ "op": "remove", "path": "/spec/template/spec/containers/0/securityContext/runAsGroup" }]'
+
+        kubectl patch deployment tekton-pipelines-controller \
+            -n tekton-pipelines \
+            --type=json \
+            -p='[{ "op": "remove", "path": "/spec/template/spec/containers/0/securityContext/runAsUser" },{ "op": "remove", "path": "/spec/template/spec/containers/0/securityContext/runAsGroup" }]'
+
+        kubectl patch deployment tekton-pipelines-remote-resolvers \
+            -n tekton-pipelines \
+            --type=json \
+            -p='[{ "op": "remove", "path": "/spec/template/spec/containers/0/securityContext/runAsUser" },{ "op": "remove", "path": "/spec/template/spec/containers/0/securityContext/runAsGroup" }]'
+        
+        kubectl patch deployment tekton-operator-proxy-webhook \
+            -n tekton-pipelines \
+            --type=json \
+            -p='[{ "op": "remove", "path": "/spec/template/spec/containers/0/securityContext/runAsUser" }]'
+
+    fi
     retry "kubectl wait --for=condition=Ready -l app=tekton-operator -n tekton-operator pod --timeout=240s" \
           "Tekton Operator did not become available within the allocated time"
-
+        
     kubectl wait --for=condition=Ready tektonconfig/config --timeout=360s
 
     echo "  ⚙️  Configuring Tekton..." >&2
     local config_dir="${script_path}/dependencies/tekton-config"
-    sanitize_for_openshift "$config_dir"
     retry "kubectl apply -k $config_dir" "The Tekton Config resource was not updated"
 
     echo "  🔄 Setting up Pipeline As Code..." >&2
     local pac_dir="${script_path}/dependencies/pipelines-as-code"
-    sanitize_for_openshift "$pac_dir"
     kubectl apply -k "$pac_dir"
 
     kubectl wait --for=condition=Ready tektonconfig/config --timeout=60s
@@ -139,14 +165,20 @@ deploy_tekton() {
             --from-literal=POSTGRES_PASSWORD="$db_password"
     fi
     local results_dir="${script_path}/dependencies/tekton-results"
-    sanitize_for_openshift "$results_dir"
     kubectl apply -k "$results_dir"
 }
 
 deploy_dex() {
     local dir="${script_path}/dependencies/dex"
-    sanitize_for_openshift "$dir"
-    kubectl apply -k "$dir"
+    if [[ "${IS_OPENSHIFT}" == "true" ]]; then
+        kubectl kustomize "$dir" | \
+            yq eval '
+                select(.kind == "Deployment" and .metadata.name == "dex")
+                    .spec.template.spec.containers[0].securityContext = load("'"$dir/SC-OCP-Patch.yaml"'")
+            ' | kubectl apply -f -
+    else
+        kubectl apply -k "$dir"
+    fi
     if ! kubectl get secret oauth2-proxy-client-secret -n dex; then
         local client_secret
         client_secret="$(openssl rand -base64 20 | tr '+/' '-_' | tr -d '\n' | tr -d '=')"
@@ -158,7 +190,6 @@ deploy_dex() {
 
 deploy_registry() {
     local dir="${script_path}/dependencies/registry"
-    sanitize_for_openshift "$dir"
     kubectl apply -k "$dir"
     retry "kubectl wait --for=condition=Ready --timeout=240s -n kind-registry -l run=registry pod" \
           "The local registry did not become available within the allocated time"
@@ -175,15 +206,12 @@ deploy_smee() {
         sed "s/$placeholder/$channel_id/g" "$template" > "$patch"
     fi
     local dir="${script_path}/dependencies/smee"
-    sanitize_for_openshift "$dir"
     kubectl apply -k "$dir"
 }
 
 deploy_kyverno() {
     local base="${script_path}/dependencies/kyverno"
     local policy="${script_path}/dependencies/kyverno/policy"
-    sanitize_for_openshift "$base"
-    sanitize_for_openshift "$policy"
     kubectl apply -k "$base" --server-side
     sleep 5
     kubectl apply -k "$policy"
